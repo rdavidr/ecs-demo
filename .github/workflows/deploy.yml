@@ -1,0 +1,222 @@
+name: Deploy to ECS
+
+on:
+  push:
+    branches:
+      - main
+    paths:
+      - 'app/**'
+      - '.github/workflows/deploy.yml'
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: 'Environment to deploy to'
+        required: true
+        default: 'dev'
+        type: choice
+        options:
+          - dev
+          - staging
+          - prod
+
+env:
+  AWS_REGION: us-east-2
+  AWS_ACCOUNT: 564044497219
+
+permissions:
+  id-token: write
+  contents: read
+
+jobs:
+  deploy:
+    name: Build and Deploy
+    runs-on: ubuntu-latest
+    
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+
+    - name: Set environment variables
+      run: |
+        # Default to dev if not specified
+        ENV_NAME="${{ github.event.inputs.environment || 'dev' }}"
+        echo "ENVIRONMENT=$ENV_NAME" >> $GITHUB_ENV
+        echo "ECS_CLUSTER=ecs-demo-$ENV_NAME" >> $GITHUB_ENV
+        echo "ECR_REPOSITORY=ecs-demo-$ENV_NAME-app" >> $GITHUB_ENV
+        
+        # Detect app name from directory structure
+        if [ -d "app" ]; then
+          APP_NAME=$(basename $PWD)-app
+        else
+          APP_NAME=$(basename $PWD)
+        fi
+        echo "APP_NAME=$APP_NAME" >> $GITHUB_ENV
+        echo "ECS_SERVICE=$APP_NAME" >> $GITHUB_ENV
+
+    - name: Configure AWS credentials
+      uses: aws-actions/configure-aws-credentials@v4
+      with:
+        role-to-assume: arn:aws:iam::${{ env.AWS_ACCOUNT }}:role/ecs-demo-${{ env.ENVIRONMENT }}-github-actions
+        aws-region: ${{ env.AWS_REGION }}
+
+    - name: Login to Amazon ECR
+      id: login-ecr
+      uses: aws-actions/amazon-ecr-login@v2
+
+    - name: Build, tag, and push image to Amazon ECR
+      id: build-image
+      env:
+        ECR_REGISTRY: ${{ steps.login-ecr.outputs.registry }}
+        IMAGE_TAG: ${{ github.sha }}
+      run: |
+        cd app
+        docker build -t $ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG .
+        docker build -t $ECR_REGISTRY/$ECR_REPOSITORY:latest .
+        docker push $ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG
+        docker push $ECR_REGISTRY/$ECR_REPOSITORY:latest
+        echo "image=$ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG" >> $GITHUB_OUTPUT
+
+    - name: Generate task definition
+      id: task-def
+      run: |
+        cat > task-definition.json <<EOF
+        {
+          "family": "${{ env.APP_NAME }}",
+          "networkMode": "awsvpc",
+          "requiresCompatibilities": ["FARGATE"],
+          "cpu": "256",
+          "memory": "512",
+          "executionRoleArn": "arn:aws:iam::${{ env.AWS_ACCOUNT }}:role/ecs-demo-${{ env.ENVIRONMENT }}-ecs-task-execution",
+          "taskRoleArn": "arn:aws:iam::${{ env.AWS_ACCOUNT }}:role/ecs-demo-${{ env.ENVIRONMENT }}-ecs-task",
+          "containerDefinitions": [
+            {
+              "name": "${{ env.APP_NAME }}",
+              "image": "${{ steps.build-image.outputs.image }}",
+              "portMappings": [
+                {
+                  "containerPort": 3000,
+                  "protocol": "tcp"
+                }
+              ],
+              "essential": true,
+              "environment": [
+                {
+                  "name": "NODE_ENV",
+                  "value": "production"
+                },
+                {
+                  "name": "PORT",
+                  "value": "3000"
+                },
+                {
+                  "name": "AWS_REGION",
+                  "value": "${{ env.AWS_REGION }}"
+                },
+                {
+                  "name": "ECS_CLUSTER",
+                  "value": "${{ env.ECS_CLUSTER }}"
+                },
+                {
+                  "name": "ENVIRONMENT",
+                  "value": "${{ env.ENVIRONMENT }}"
+                }
+              ],
+              "logConfiguration": {
+                "logDriver": "awslogs",
+                "options": {
+                  "awslogs-group": "/ecs/ecs-demo-${{ env.ENVIRONMENT }}",
+                  "awslogs-region": "${{ env.AWS_REGION }}",
+                  "awslogs-stream-prefix": "${{ env.APP_NAME }}"
+                }
+              },
+              "healthCheck": {
+                "command": ["CMD-SHELL", "curl -f http://localhost:3000/health || exit 1"],
+                "interval": 30,
+                "timeout": 3,
+                "retries": 3,
+                "startPeriod": 60
+              }
+            }
+          ]
+        }
+        EOF
+        echo "task-definition=task-definition.json" >> $GITHUB_OUTPUT
+
+    - name: Register task definition
+      id: register-task
+      run: |
+        TASK_DEFINITION_ARN=$(aws ecs register-task-definition \
+          --cli-input-json file://task-definition.json \
+          --query 'taskDefinition.taskDefinitionArn' \
+          --output text)
+        echo "task-definition-arn=$TASK_DEFINITION_ARN" >> $GITHUB_OUTPUT
+
+    - name: Check if service exists
+      id: check-service
+      run: |
+        if aws ecs describe-services \
+          --cluster ${{ env.ECS_CLUSTER }} \
+          --services ${{ env.ECS_SERVICE }} \
+          --query 'services[0].status' \
+          --output text 2>/dev/null | grep -q "ACTIVE"; then
+          echo "service-exists=true" >> $GITHUB_OUTPUT
+        else
+          echo "service-exists=false" >> $GITHUB_OUTPUT
+        fi
+
+    - name: Get infrastructure outputs
+      id: get-outputs
+      if: steps.check-service.outputs.service-exists == 'false'
+      run: |
+        # Get subnet IDs
+        SUBNETS=$(aws ec2 describe-subnets \
+          --filters "Name=vpc-id,Values=$(aws ec2 describe-vpcs --filters "Name=tag:Name,Values=ecs-demo-${{ env.ENVIRONMENT }}-vpc" --query 'Vpcs[0].VpcId' --output text)" \
+          "Name=tag:Type,Values=Private" \
+          --query 'Subnets[*].SubnetId' \
+          --output json | jq -r '. | join(",")')
+        echo "subnets=$SUBNETS" >> $GITHUB_OUTPUT
+        
+        # Get security group
+        SG=$(aws ec2 describe-security-groups \
+          --filters "Name=group-name,Values=ecs-demo-${{ env.ENVIRONMENT }}-ecs-tasks" \
+          --query 'SecurityGroups[0].GroupId' \
+          --output text)
+        echo "security-group=$SG" >> $GITHUB_OUTPUT
+        
+        # Get target group ARN
+        TG_ARN=$(aws elbv2 describe-target-groups \
+          --names "ecs-demo-${{ env.ENVIRONMENT }}" \
+          --query 'TargetGroups[0].TargetGroupArn' \
+          --output text)
+        echo "target-group-arn=$TG_ARN" >> $GITHUB_OUTPUT
+
+    - name: Create service
+      if: steps.check-service.outputs.service-exists == 'false'
+      run: |
+        aws ecs create-service \
+          --cluster ${{ env.ECS_CLUSTER }} \
+          --service-name ${{ env.ECS_SERVICE }} \
+          --task-definition ${{ steps.register-task.outputs.task-definition-arn }} \
+          --desired-count 2 \
+          --launch-type FARGATE \
+          --network-configuration "awsvpcConfiguration={subnets=[${{ steps.get-outputs.outputs.subnets }}],securityGroups=[${{ steps.get-outputs.outputs.security-group }}],assignPublicIp=DISABLED}" \
+          --load-balancers "targetGroupArn=${{ steps.get-outputs.outputs.target-group-arn }},containerName=${{ env.APP_NAME }},containerPort=3000" \
+          --health-check-grace-period-seconds 60
+
+    - name: Update service
+      if: steps.check-service.outputs.service-exists == 'true'
+      run: |
+        aws ecs update-service \
+          --cluster ${{ env.ECS_CLUSTER }} \
+          --service ${{ env.ECS_SERVICE }} \
+          --task-definition ${{ steps.register-task.outputs.task-definition-arn }} \
+          --force-new-deployment
+
+    - name: Wait for service stability
+      run: |
+        aws ecs wait services-stable \
+          --cluster ${{ env.ECS_CLUSTER }} \
+          --services ${{ env.ECS_SERVICE }}
+        
+        echo "🚀 Deployment complete!"
+        echo "Service URL: http://$(aws elbv2 describe-load-balancers --names ecs-demo-${{ env.ENVIRONMENT }} --query 'LoadBalancers[0].DNSName' --output text)"
