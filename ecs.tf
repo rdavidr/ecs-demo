@@ -143,13 +143,13 @@ resource "aws_lb_target_group" "main" {
     enabled             = true
     healthy_threshold   = 2
     unhealthy_threshold = 2
-    timeout             = 5
-    interval            = 30
-    path                = "/"
+    timeout             = 3
+    interval            = 15
+    path                = "/health"
     matcher             = "200"
   }
 
-  deregistration_delay = 30
+  deregistration_delay = 10
 
   tags = local.tags
 }
