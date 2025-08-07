@@ -11,6 +11,9 @@ RUN npm ci --only=production
 # Copy application code
 COPY . .
 
+# Make healthcheck script executable
+RUN chmod +x healthcheck.js
+
 # Expose port
 EXPOSE 3000
 

@@ -130,7 +130,7 @@ jobs:
                 }
               },
               "healthCheck": {
-                "command": ["CMD-SHELL", "curl -f http://localhost:3000/health || exit 1"],
+                "command": ["CMD-SHELL", "node healthcheck.js"],
                 "interval": 15,
                 "timeout": 3,
                 "retries": 3,
